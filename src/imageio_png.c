@@ -75,239 +75,187 @@ static void palette_kmeans_quantize (const uint8_t *p_src, size_t n_samples, siz
 }
 
 
-static void write_png_chunk (char *p_name, uint8_t *p_data, uint32_t len, FILE *fp) {
+static uint8_t * put_value_bigendian (uint8_t *p_buf, uint32_t value, int n) {
+    n --;
+    n *= 8;
+    for (; n>=0; n-=8) {
+        *(p_buf++) = (value >> n);
+    }
+    return p_buf;
+}
+
+
+static uint8_t * put_png_chunk (uint8_t *p_dst_start, uint8_t *p_dst_end, char *p_name) {
     const static uint32_t crc_table[] = {0, 0x1db71064, 0x3b6e20c8, 0x26d930ac, 0x76dc4190, 0x6b6b51f4, 0x4db26158, 0x5005713c, 0xedb88320, 0xf00f9344, 0xd6d6a3e8, 0xcb61b38c, 0x9b64c2b0, 0x86d3d2d4, 0xa00ae278, 0xbdbdf21c };
-    uint32_t i, crc=0xFFFFFFFF;
-    fputc(((len>>24) & 0xFF), fp);
-    fputc(((len>>16) & 0xFF), fp);
-    fputc(((len>> 8) & 0xFF), fp);
-    fputc(((len    ) & 0xFF), fp);
-    fwrite(p_name, sizeof(uint8_t),   4, fp);
-    if (len > 0) {
-        fwrite(p_data, sizeof(uint8_t), len, fp);
-    }
-    for (i=0; i<4; i++) {
-        crc ^= p_name[i];
-        crc = (crc >> 4) ^ crc_table[crc & 15];
-        crc = (crc >> 4) ^ crc_table[crc & 15];
-    }
-    for (i=0; i<len; i++) {
-        crc ^= p_data[i];
+    uint32_t crc=0xFFFFFFFF;
+    put_value_bigendian(p_dst_start, ((p_dst_end-p_dst_start)-8), 4);  // write chunk len (only payload)
+    p_dst_start += 4;
+    memcpy(p_dst_start, p_name, 4);                                    // write chunk name
+    for (; p_dst_start<p_dst_end; p_dst_start++) {                     // calculate CRC (name + payload)
+        crc ^= p_dst_start[0];
         crc = (crc >> 4) ^ crc_table[crc & 15];
         crc = (crc >> 4) ^ crc_table[crc & 15];
     }
     crc = ~crc;
-    fputc(((crc>>24) & 0xFF), fp);
-    fputc(((crc>>16) & 0xFF), fp);
-    fputc(((crc>> 8) & 0xFF), fp);
-    fputc(((crc    ) & 0xFF), fp);
+    put_value_bigendian(p_dst_start, crc, 4);
+    return p_dst_start + 4;
+}
+
+
+static uint8_t * put_uncompressed_deflate (uint8_t *p_dst, const uint8_t *p_img, uint32_t height, uint32_t width, size_t byte_per_row, uint8_t color_type, uint8_t bit_depth) {
+    size_t h, w, deflate_block_pos=0;
+    uint32_t adler_a=1, adler_b=0;
+    *(p_dst++) = 0x78;
+    *(p_dst++) = 0x01;
+    for (h=0; h<height; h++) {
+        const uint8_t *p_pixel = p_img;
+        for (w=0; w<byte_per_row; w++) {
+            if (deflate_block_pos == 0) {
+                p_dst[0] = 0x00;  // deflate block start (5bytes)
+                p_dst[1] = 0xFF;
+                p_dst[2] = 0xFF;
+                p_dst[3] = 0x00;
+                p_dst[4] = 0x00;
+                p_dst += 5;
+            }
+            if (w == 0) {
+                p_dst[0] = 0;     // filter at each start of line
+            } else if (bit_depth == 1) {
+                p_dst[0] = (p_pixel[0]<<7) | (p_pixel[1]<<6) | (p_pixel[2]<<5) | (p_pixel[3]<<4) | (p_pixel[4]<<3) | (p_pixel[5]<<2) | (p_pixel[6]<<1) | (p_pixel[7]);
+                p_pixel += 8;
+            } else if (bit_depth == 2) {
+                p_dst[0] = (p_pixel[0]<<6) | (p_pixel[1]<<4) | (p_pixel[2]<<2) | (p_pixel[3]);
+                p_pixel += 4;
+            } else if (bit_depth == 4) {
+                p_dst[0] = (p_pixel[0]<<4) | (p_pixel[1]);
+                p_pixel += 2;
+            } else {
+                p_dst[0] = p_pixel[0];
+                p_pixel ++;
+            }
+            adler_a = (adler_a + p_dst[0]) % 65521;
+            adler_b = (adler_b + adler_a)  % 65521;
+            p_dst ++;
+            deflate_block_pos = (deflate_block_pos + 1) % 0xFFFF;
+        }
+        p_img += (color_type==2) ? (3*width) : width;
+    }
+    p_dst[-deflate_block_pos-5] = 0x01;
+    if (deflate_block_pos != 0) {
+        p_dst[-deflate_block_pos-4] = (( deflate_block_pos)   ) & 0xFF;
+        p_dst[-deflate_block_pos-3] = (( deflate_block_pos)>>8) & 0xFF;
+        p_dst[-deflate_block_pos-2] = ((~deflate_block_pos)   ) & 0xFF;
+        p_dst[-deflate_block_pos-1] = ((~deflate_block_pos)>>8) & 0xFF;
+    }
+    p_dst = put_value_bigendian(p_dst, adler_b, 2);
+    p_dst = put_value_bigendian(p_dst, adler_a, 2);
+    return p_dst;
+}
+
+
+// return:   0: failed    1: dst_size
+// n_cluster:    0:do not cluster (color_type=0 or 2)    >0:cluster to palette (color_type=3)
+static size_t png_encode (uint8_t *p_dst, const uint8_t *p_img, int is_rgb, uint32_t height, uint32_t width, int n_cluster) {
+    uint8_t *p_dst_base=p_dst, *p_img_palette=NULL;
+    uint8_t  color_type, bit_depth;
+    size_t   byte_per_row;
+    
+    if (width < 1 || height < 1) {   // if width and height invalid, write a 1x1 gray image
+        return 0;
+    }
+    
+    if (((size_t)height)*width  <= 512) n_cluster = 0;
+    if (n_cluster < 2  ) n_cluster = 0;
+    if (n_cluster > 256) n_cluster = 256;
+    
+    if (!is_rgb) {
+        color_type = 0;                       // gray, 8-bit per pixel
+        bit_depth  = 8;
+        byte_per_row = 1 + width;
+    } else if (n_cluster == 0) {
+        color_type = 2;                       // RGB, 24-bit per pixel
+        bit_depth  = 8;
+        byte_per_row = 1 + width * 3;
+    } else {
+        color_type = 3;                       // RGB, 8-bit palette index per pixel
+        if      (n_cluster <= 2 ) bit_depth = 1;
+        else if (n_cluster <= 4 ) bit_depth = 2;
+        else if (n_cluster <= 16) bit_depth = 4;
+        else                                     bit_depth = 8;
+        byte_per_row = 1 + (width + (8/bit_depth) - 1) / (8/bit_depth);
+    }
+    
+    // write 8-bit PNG magic
+    memcpy(p_dst, "\x89PNG\r\n\32\n", 8);
+    p_dst += 8;
+    
+    {   // write IHDR
+        uint8_t *p_chunk_start = p_dst;
+        p_dst += 8;
+        p_dst = put_value_bigendian(p_dst, width, 4);
+        p_dst = put_value_bigendian(p_dst, height, 4);
+        p_dst = put_value_bigendian(p_dst, bit_depth, 1);
+        p_dst = put_value_bigendian(p_dst, color_type, 1);
+        p_dst = put_value_bigendian(p_dst, 0, 3);
+        p_dst = put_png_chunk(p_chunk_start, p_dst, "IHDR");
+    }
+    
+    if (color_type == 3) {
+        uint8_t *p_chunk_start=p_dst, *p_tmp_buffer;
+        p_dst += 8;
+        p_img_palette = (uint8_t*)malloc((size_t)height*width + 12*256*sizeof(uint32_t));
+        p_tmp_buffer  = p_img_palette +  (size_t)height*width;
+        if (p_img_palette == NULL) {
+            return 0;
+        }
+        palette_kmeans_quantize(p_img, (((size_t)width)*height), n_cluster, p_dst, p_img_palette, p_tmp_buffer);
+        p_dst += (3 * n_cluster);
+        p_dst = put_png_chunk(p_chunk_start, p_dst, "PLTE");
+        p_img = p_img_palette;
+    }
+    
+    {   // write IDAT
+        uint8_t *p_chunk_start = p_dst;
+        p_dst += 8;
+        p_dst = put_uncompressed_deflate(p_dst, p_img, height, width, byte_per_row, color_type, bit_depth);
+        p_dst = put_png_chunk(p_chunk_start, p_dst, "IDAT");
+    }
+    
+    // write IEND
+    p_dst = put_png_chunk(p_dst, p_dst+8, "IEND");
+    
+    if (color_type == 3) {
+        free(p_img_palette);
+    }
+    
+    return (p_dst - p_dst_base);
 }
 
 
 // return:   0 : success    1 : failed
-// n_rgb_cluster_to_palette:    0:do not cluster (color_type=0 or 2)    >0:cluster to palette (color_type=3)
-int writePNGImageFile (const char *p_filename, const uint8_t *p_buf, int is_rgb, uint32_t height, uint32_t width, int n_rgb_cluster_to_palette) {
-    FILE    *fp;
-    uint8_t *p_dst, *p_palette_index=NULL, *p_tmp_buffer_for_kmeans=NULL;
-    size_t   byte_per_row;
-    uint8_t  color_type, bit_depth=8;
-    
-    if (width < 1 || height < 1)
-        return 1;
-    
-    if (!is_rgb) {
-        color_type   = 0;                       // gray, 8-bit per pixel
-        byte_per_row = 1 + width;
-    } else if (n_rgb_cluster_to_palette <= 0 || ((size_t)height*width <= 256)) {
-        n_rgb_cluster_to_palette = 0;
-        color_type   = 2;                       // RGB, 24-bit per pixel
-        byte_per_row = 1 + width * 3;
-    } else {
-        color_type   = 3;                       // RGB, 8-bit palette index per pixel
-        if (n_rgb_cluster_to_palette < 2  ) n_rgb_cluster_to_palette = 2;
-        if (n_rgb_cluster_to_palette > 256) n_rgb_cluster_to_palette = 256;
-        if      (n_rgb_cluster_to_palette <= 2 ) bit_depth = 1;
-        else if (n_rgb_cluster_to_palette <= 4 ) bit_depth = 2;
-        else if (n_rgb_cluster_to_palette <= 16) bit_depth = 4;
-        byte_per_row = 1 + (width + (8/bit_depth) - 1) / (8/bit_depth);
-    }
-    
-    if (color_type == 3) {
-        p_dst = (uint8_t*)malloc((size_t)(byte_per_row+8)*height + 1048576 + (size_t)height*width + 64 + 12*256*sizeof(uint32_t));
-        p_palette_index = p_dst+ (size_t)(byte_per_row+8)*height + 1048576;
-        p_tmp_buffer_for_kmeans = p_palette_index +                          (size_t)height*width + 64;
-    } else {
-        p_dst = (uint8_t*)malloc((size_t)(byte_per_row+8)*height + 1048576);
-    }
-
-    if (p_dst == NULL)
-        return 1;
-    
-    if ((fp = fopen(p_filename, "wb")) == NULL) {
-        free(p_dst);
+int writePNGImageFile (const char *p_filename, const uint8_t *p_buf, int is_rgb, uint32_t height, uint32_t width, int n_cluster) {
+    FILE *fp;
+    size_t png_size;
+    uint8_t *p_png_buf = (uint8_t*)malloc(((size_t)(is_rgb?3:1)) * ((size_t)height + 16) * ((size_t)width + 16) + 1048576);
+    if (p_png_buf == NULL) {
         return 1;
     }
-    
-    fwrite("\x89PNG\r\n\32\n", sizeof(char), 8, fp);    // 8-bit PNG magic
-    
-    {
-        p_dst[ 0] = (uint8_t)( width>>24);
-        p_dst[ 1] = (uint8_t)( width>>16);
-        p_dst[ 2] = (uint8_t)( width>> 8);
-        p_dst[ 3] = (uint8_t)( width    );
-        p_dst[ 4] = (uint8_t)(height>>24);
-        p_dst[ 5] = (uint8_t)(height>>16);
-        p_dst[ 6] = (uint8_t)(height>> 8);
-        p_dst[ 7] = (uint8_t)(height    );
-        p_dst[ 8] = bit_depth;
-        p_dst[ 9] = color_type;
-        p_dst[10] = 0;
-        p_dst[11] = 0;
-        p_dst[12] = 0;
-        write_png_chunk("IHDR", p_dst, 13, fp);
+    png_size = png_encode(p_png_buf, p_buf, is_rgb, height, width, n_cluster);
+    if (png_size <= 0) {
+        free(p_png_buf);
+        return 1;
     }
-
-    if (color_type == 3) {
-        palette_kmeans_quantize(p_buf, (((size_t)width)*height), n_rgb_cluster_to_palette, p_dst, p_palette_index, p_tmp_buffer_for_kmeans);
-        p_buf = p_palette_index;
-        write_png_chunk("PLTE", p_dst, (3*n_rgb_cluster_to_palette), fp);
+    fp = fopen(p_filename, "wb");
+    if (fp == NULL) {
+        free(p_png_buf);
+        return 1;
     }
-    
-    {
-        size_t h, w, i=0;
-        uint32_t adler_a=1, adler_b=0;
-        uint8_t *p=p_dst , *p_last_blk=p_dst;
-        *p++ = 0x78;
-        *p++ = 0x01;
-        for (h=0; h<height; h++) {
-            const uint8_t *p_pixel = p_buf;
-            for (w=0; w<byte_per_row; w++) {
-                if (i%0xFFFF == 0) {
-                    *p++ = 0;                 // deflate block start (5bytes)
-                    *p++ = 0xFF;
-                    *p++ = 0xFF;
-                    *p++ = 0x00;
-                    *p++ = 0x00;
-                    p_last_blk = p;
-                }
-                if (w == 0) {
-                    *p = 0;                   // filter at each start of line
-                } else if (bit_depth == 1) {
-                    *p = (p_pixel[0]<<7) | (p_pixel[1]<<6) | (p_pixel[2]<<5) | (p_pixel[3]<<4) | (p_pixel[4]<<3) | (p_pixel[5]<<2) | (p_pixel[6]<<1) | (p_pixel[7]);
-                    p_pixel += 8;
-                } else if (bit_depth == 2) {
-                    *p = (p_pixel[0]<<6) | (p_pixel[1]<<4) | (p_pixel[2]<<2) | (p_pixel[3]);
-                    p_pixel += 4;
-                } else if (bit_depth == 4) {
-                    *p = (p_pixel[0]<<4) | (p_pixel[1]);
-                    p_pixel += 2;
-                } else {
-                    *p = p_pixel[0];
-                    p_pixel ++;
-                }
-                adler_a = (adler_a + *p)      % 65521;
-                adler_b = (adler_b + adler_a) % 65521;
-                p ++;
-                i ++;
-            }
-            p_buf += (color_type==2) ? (3*width) : width;
-        }
-        {
-            uint32_t len_last_block = p - p_last_blk;
-            p_last_blk[-5] = 1;
-            p_last_blk[-4] = (  len_last_block    ) & 0xFF;
-            p_last_blk[-3] = (  len_last_block >>8) & 0xFF;
-            p_last_blk[-2] = ((~len_last_block)   ) & 0xFF;
-            p_last_blk[-1] = ((~len_last_block)>>8) & 0xFF;
-            adler_a |= (adler_b << 16);
-            *p++ = (adler_a>>24) & 0xFF;
-            *p++ = (adler_a>>16) & 0xFF;
-            *p++ = (adler_a>> 8) & 0xFF;
-            *p++ = (adler_a    ) & 0xFF;
-        }
-        write_png_chunk("IDAT", p_dst, (size_t)(p-p_dst), fp);
+    if (fwrite(p_png_buf, sizeof(uint8_t), png_size, fp) != png_size) {
+        free(p_png_buf);
+        fclose(fp);
+        return 1;
     }
-    
-    write_png_chunk("IEND", NULL, 0, fp);
-    
-    free(p_dst);
+    free(p_png_buf);
     fclose(fp);
     return 0;
 }
-
-
-
-
-
-
-
-// #include "uPNG/uPNG.h"
-
-
-// // return:  NULL     : failed
-// //          non-NULL : pointer to image pixels, allocated by malloc(), need to be free() later
-// uint8_t* loadPNGImageFile (const char *p_filename, int *p_is_rgb, uint32_t *p_height, uint32_t *p_width) {
-//     upng_t     *p_upng;
-//     upng_error  err;
-//     upng_format png_format;
-//     static const char *upng_format_names[] = {
-//         (const char*)"BADFORMAT",
-//         (const char*)"RGB8",
-//         (const char*)"RGB16",
-//         (const char*)"RGBA8",
-//         (const char*)"RGBA16",
-//         (const char*)"LUMA1",
-//         (const char*)"LUMA2",
-//         (const char*)"LUMA4",
-//         (const char*)"LUMA8",
-//         (const char*)"LUMA_ALPHA1",
-//         (const char*)"LUMA_ALPHA2",
-//         (const char*)"LUMA_ALPHA4",
-//         (const char*)"LUMA_ALPHA8"
-//     };
-//     size_t img_size;
-//     uint8_t *p_dst_base, *p_dst;
-//     const uint8_t *p_src;
-//     p_upng = upng_new_from_file(p_filename);
-//     if (p_upng == NULL) {
-//         return NULL;
-//     }
-//     err = upng_decode(p_upng);
-//     if (err != UPNG_EOK) {
-//         if (err==UPNG_EUNSUPPORTED || err==UPNG_EUNINTERLACED || err==UPNG_EUNFORMAT)
-//             printf("   ***ERROR: this PNG format is not-yet supported, error code = %d\n", err);
-//         upng_free(p_upng);
-//         return NULL;
-//     }
-//     png_format = upng_get_format(p_upng);
-//     if (png_format != UPNG_RGBA8 && png_format != UPNG_RGB8 && png_format != UPNG_LUMINANCE8) {
-//         printf("   ***ERROR: only support LUMA8, RGB8, and RGBA8. But this PNG is %s\n", upng_format_names[png_format]);
-//         upng_free(p_upng);
-//         return NULL;
-//     }
-//     *p_is_rgb = (png_format != UPNG_LUMINANCE8);
-//     *p_height = upng_get_height(p_upng);
-//     *p_width  = upng_get_width(p_upng);
-//     img_size = (size_t)((*p_is_rgb)?3:1) * (*p_height) * (*p_width);
-//     p_dst_base = p_dst = (uint8_t*)malloc(img_size);
-//     if (p_dst_base) {
-//         size_t i;
-//         p_src = upng_get_buffer(p_upng);
-//         if (png_format == UPNG_RGBA8) {
-//             printf("   *warning: disard alpha channel of this PNG\n");
-//             for (i=(size_t)(*p_height)*(*p_width); i>0; i--) {
-//                 p_dst[0] = p_src[0];
-//                 p_dst[1] = p_src[1];
-//                 p_dst[2] = p_src[2];
-//                 p_dst += 3;
-//                 p_src += 4;
-//             }
-//         } else {
-//             for (i=img_size; i>0; i--) {
-//                 *(p_dst++) = *(p_src++);
-//             }
-//         }
-//     }
-//     upng_free(p_upng);
-//     return p_dst_base;
-// }
