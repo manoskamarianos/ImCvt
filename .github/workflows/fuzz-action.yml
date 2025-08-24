@@ -5,7 +5,7 @@ jobs:
   build-fuzz-docker:
     runs-on: ubuntu-latest
     env:
-      IMAGE_NAME: imcvt
+      IMAGE_NAME: manoskamarianos/imcvt
       COMMIT_SHA: ${{ github.sha }}
     steps:
       - name: Checkout repository
