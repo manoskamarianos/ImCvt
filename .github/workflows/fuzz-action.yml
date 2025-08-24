@@ -38,7 +38,7 @@ jobs:
           tar czf fuzz_output.tar.gz fuzz_output
 
       - name: Upload fuzzing results as artifact
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: fuzz-results
           path: fuzz_output.tar.gz
