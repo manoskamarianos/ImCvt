@@ -31,7 +31,7 @@ jobs:
       - name: Run AFL++
         run: |
           mkdir fuzz_output
-          timeout 300 docker run --rm -v $PWD/fuzz_output:/src/fuzz_output ghcr.io/${IMAGE_NAME}:latest
+          timeout 300 docker run --rm -v $PWD/fuzz_output:/src/fuzz_output ghcr.io/${IMAGE_NAME}:latest || true
 
       - name: Compress fuzzing results
         run: |
