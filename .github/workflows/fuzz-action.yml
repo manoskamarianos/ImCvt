@@ -33,6 +33,11 @@ jobs:
           mkdir fuzz_output
           timeout 300 docker run --rm -v $PWD/fuzz_output:/src/fuzz_output ghcr.io/${IMAGE_NAME}:latest || true
 
+      - name: Fix permissions on fuzz_output
+        run: |
+          sudo chown -R "$USER":"$USER" fuzz_output || true
+          chmod -R a+rX fuzz_output || true
+
       - name: Compress fuzzing results
         run: |
           tar czf fuzz_output.tar.gz fuzz_output
