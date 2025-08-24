@@ -1,5 +1,5 @@
 name: fuzz-action
-run-name: ${{ github.actor }} is running fuzzing campain
+run-name: ${{ github.actor }} is running fuzzing campaign
 on: [push]
 jobs:
   build-fuzz-docker:
@@ -28,16 +28,16 @@ jobs:
           docker push ghcr.io/${IMAGE_NAME}:${COMMIT_SHA}
           docker push ghcr.io/${IMAGE_NAME}:latest
 
-     - name: Run AFL++
+      - name: Run AFL++
         run: |
           mkdir fuzz_output
           timeout 300 docker run --rm -v $PWD/fuzz_output:/src/fuzz_output ghcr.io/${IMAGE_NAME}:latest
 
-     - name: Compress fuzzing results
+      - name: Compress fuzzing results
         run: |
           tar czf fuzz_output.tar.gz fuzz_output
 
-     - name: Upload fuzzing results as artifact
+      - name: Upload fuzzing results as artifact
         uses: actions/upload-artifact@v3
         with:
           name: fuzz-results
