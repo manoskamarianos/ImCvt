@@ -5,7 +5,7 @@ jobs:
   build-fuzz-docker:
     runs-on: ubuntu-latest
     env:
-      IMAGE_NAME: ${{ github.repository }}
+      IMAGE_NAME: ${{ toLower(github.repository) }}
       COMMIT_SHA: ${{ github.sha }}
     steps:
       - name: Checkout repository
